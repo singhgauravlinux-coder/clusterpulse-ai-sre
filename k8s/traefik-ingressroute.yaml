@@ -4,7 +4,7 @@ apiVersion: traefik.io/v1alpha1
 kind: IngressRoute
 metadata:
   name: clusterpulse-http-redirect
-  namespace: observability
+  namespace: clusterpulse
 spec:
   entryPoints:
     - web
@@ -21,7 +21,7 @@ apiVersion: traefik.io/v1alpha1
 kind: IngressRoute
 metadata:
   name: clusterpulse-https
-  namespace: observability
+  namespace: clusterpulse
 spec:
   entryPoints:
     - websecure
