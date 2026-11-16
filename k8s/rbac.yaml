@@ -7,7 +7,7 @@ metadata:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  name: k8s-ai-rca-agent
+  name: k8s-ai-rca-agent-clusterpulse
 rules:
 - apiGroups: [""]
   # configmaps/serviceaccounts feed the topology graph. ConfigMap *contents* are never returned (key count only).
@@ -42,11 +42,11 @@ rules:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
-  name: k8s-ai-rca-agent
+  name: k8s-ai-rca-agent-clusterpulse
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
-  name: k8s-ai-rca-agent
+  name: k8s-ai-rca-agent-clusterpulse
 subjects:
 - kind: ServiceAccount
   name: k8s-ai-rca-agent
