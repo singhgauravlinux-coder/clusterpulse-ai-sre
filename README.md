@@ -27,8 +27,9 @@ The agent does not perform remediation. Review all AI recommendations before exe
 
 ## Requirements
 
-- Kubernetes 1.24+ and a namespace named `observability`
-- PostgreSQL reachable from the agent
+- Kubernetes 1.24+ and a namespace named `clusterpulse`
+- PostgreSQL reachable from the agent (`k8s/postgres.yaml` deploys a dedicated one in the same namespace)
+- A default StorageClass (k3s ships `local-path`) for the PostgreSQL PVC
 - Container registry reachable by cluster nodes
 - Egress to configured AI endpoint and the organization SMTP relay
 - SMTP relay credentials and an approved sender mailbox
@@ -48,31 +49,121 @@ docker push YOUR_REGISTRY/k8s-ai-rca-agent:0.1.0
 
 ## Configure and deploy
 
-1. Create PostgreSQL database `rca` and user with schema creation rights.
-2. Provision SMTP username/password and AI/database credentials through your secret manager. Do not commit real secrets.
-3. Replace image in `k8s/deployment.yaml`.
-4. Apply:
+Everything runs in the `clusterpulse` namespace, including its own PostgreSQL.
+Run all commands from the repository root after `git pull`.
+
+### 1. Namespace and PostgreSQL
 
 ```bash
-kubectl create namespace observability
-kubectl apply -f k8s/rbac.yaml
-kubectl apply -f k8s/configmap.yaml
-# Create k8s-ai-rca-secrets from your secret manager or a secured deployment pipeline.
-kubectl apply -f k8s/deployment.yaml
-kubectl -n observability rollout status deployment/k8s-ai-rca-agent
-kubectl -n observability logs deployment/k8s-ai-rca-agent -f
+kubectl create namespace clusterpulse
+
+# Database credentials (generate a password; keep it in this shell for step 3)
+PGPASS=$(openssl rand -hex 16)
+kubectl -n clusterpulse create secret generic clusterpulse-postgres-auth \
+  --from-literal=POSTGRES_USER=clusterpulse \
+  --from-literal=POSTGRES_PASSWORD=$PGPASS \
+  --from-literal=POSTGRES_DB=clusterpulse
+
+kubectl apply -f k8s/postgres.yaml
+kubectl -n clusterpulse rollout status sts/clusterpulse-postgres
+kubectl -n clusterpulse exec sts/clusterpulse-postgres -- pg_isready
+kubectl -n clusterpulse get pvc            # data-clusterpulse-postgres-0 must be Bound
 ```
+
+`k8s/postgres.yaml` creates a headless Service `clusterpulse-postgres` and a
+StatefulSet whose `volumeClaimTemplates` provisions the PVC
+`data-clusterpulse-postgres-0` (5Gi, default StorageClass) automatically.
+The application creates its tables on first start (`init_db()`), so the database
+only needs to exist. Deleting the StatefulSet keeps the PVC and your data; delete
+the PVC explicitly to start with an empty database.
+
+To use an external or managed PostgreSQL instead, skip `postgres.yaml` and put
+that connection string in `DATABASE_URL` below.
+
+### 2. Configuration and secrets
+
+Edit `k8s/configmap.yaml` (cluster name, `PROMETHEUS_URL`, AI endpoint and model),
+then create the application secret. Do not commit a populated copy:
+
+```bash
+kubectl apply -f k8s/configmap.yaml
+
+kubectl -n clusterpulse create secret generic k8s-ai-rca-secrets \
+  --from-literal=DATABASE_URL="postgresql+psycopg://clusterpulse:${PGPASS}@clusterpulse-postgres:5432/clusterpulse" \
+  --from-literal=AI_API_KEY='CHANGE_ME' \
+  --from-literal=SMTP_USERNAME='CHANGE_ME' \
+  --from-literal=SMTP_PASSWORD='CHANGE_ME'
+```
+
+See `k8s/secret-template.yaml` and `k8s/config-secret-template.yaml` for the full
+key list (for example Microsoft Graph mail settings). If you already have these
+values in another namespace, copy them instead of retyping:
+
+```bash
+strip='del(.metadata.uid,.metadata.resourceVersion,.metadata.creationTimestamp,.metadata.managedFields,.metadata.annotations,.metadata.ownerReferences) | .metadata.namespace="clusterpulse"'
+for obj in configmap/k8s-ai-rca-config secret/k8s-ai-rca-secrets secret/clusterpulse-users secret/clusterpulse-tls; do
+  kubectl -n <old-namespace> get $obj -o json | jq "$strip" | kubectl apply -f -
+done
+```
+
+After copying, set `DATABASE_URL` to the new `clusterpulse-postgres` host, otherwise
+the new namespace would keep using the old database.
+
+### 3. RBAC and application
+
+```bash
+kubectl apply -f k8s/rbac.yaml
+kubectl apply -f k8s/deployment.yaml
+kubectl -n clusterpulse rollout status deployment/k8s-ai-rca-agent
+kubectl -n clusterpulse logs deployment/k8s-ai-rca-agent -f
+```
+
+The ClusterRole and ClusterRoleBinding are named `k8s-ai-rca-agent-clusterpulse`.
+Cluster-scoped objects are shared by every namespace, so another installation of this
+agent (for example in an older namespace) must not use the same names; otherwise
+applying one overwrites the other's permissions and it starts logging `403 Forbidden`.
 
 For production, provision secrets with your enterprise secret manager rather than
 checking plaintext Kubernetes Secret manifests into source control. Ensure etcd
 encryption at rest and network policies restrict egress.
+
+### 4. Routes and verification
+
+See "Production deployment: Traefik + Basic Auth + Prometheus" below for TLS,
+Basic Auth and the IngressRoute. Quick check without ingress:
+
+```bash
+kubectl -n clusterpulse port-forward svc/k8s-ai-rca-agent 8080:8080 &
+curl -s localhost:8080/readyz        # ready once PostgreSQL is reachable
+kubectl auth can-i list pods --all-namespaces \
+  --as=system:serviceaccount:clusterpulse:k8s-ai-rca-agent    # yes
+```
+
+### Running next to another installation
+
+Two copies can run side by side if they have: separate databases, a different
+`Host(...)` in `k8s/traefik-ingressroute.yaml`, and distinct ClusterRole /
+ClusterRoleBinding names. Both copies watch the same cluster, so both will send
+alert emails unless you give one of them different `EMAIL_RECIPIENTS` or scale it
+down.
+
+### Troubleshooting
+
+| Symptom | Cause and fix |
+|---|---|
+| Pod `CrashLoopBackOff`, exit code 3, log `Name or service not known` | `DATABASE_URL` host does not resolve from this namespace. Use `clusterpulse-postgres` (same namespace) or a fully qualified `<svc>.<ns>.svc.cluster.local`. |
+| Log `connection timed out` to Postgres | A NetworkPolicy on the database namespace blocks ingress from `clusterpulse`. |
+| Log `password authentication failed` | `DATABASE_URL` credentials differ from `clusterpulse-postgres-auth`. The password is fixed at first start; if you recreate the secret, delete the PVC too. |
+| Log `... is forbidden: User "system:serviceaccount:<ns>:k8s-ai-rca-agent" cannot list/watch ...` | ClusterRoleBinding subject points at another namespace or was overwritten. `kubectl get clusterrolebinding <name> -o yaml` and re-apply `k8s/rbac.yaml` from this repo. |
+| PVC `Pending` | No default StorageClass. Set `storageClassName` in `k8s/postgres.yaml`. With `local-path`, `Pending` until the pod is scheduled is normal. |
+| `/readyz` returns 503 | PostgreSQL unreachable. The pod is withheld from traffic, not restarted. |
 
 ## API
 
 Port-forward:
 
 ```bash
-kubectl -n observability port-forward svc/k8s-ai-rca-agent 8080:8080
+kubectl -n clusterpulse port-forward svc/k8s-ai-rca-agent 8080:8080
 ```
 
 - `GET /healthz`
@@ -131,7 +222,7 @@ Deploy the dashboard ingress after installing an ingress controller and creating
 the TLS secret:
 
 ```bash
-kubectl -n observability create secret tls clusterpulse-tls \
+kubectl -n clusterpulse create secret tls clusterpulse-tls \
   --cert=./tls.crt --key=./tls.key
 kubectl apply -f k8s/traefik-ingressroute.yaml
 ```
@@ -172,7 +263,7 @@ Create a TLS certificate trusted by your organization's client devices. For an
 internal CA, distribute the CA certificate to managed browsers/workstations.
 
 ```bash
-kubectl -n observability create secret tls clusterpulse-tls \
+kubectl -n clusterpulse create secret tls clusterpulse-tls \
   --cert=./tls.crt --key=./tls.key
 ```
 
@@ -196,7 +287,7 @@ Store that line in a file named `users` with restrictive local permissions:
 ```bash
 umask 077
 # Paste the htpasswd output into ./users using a secure editor.
-kubectl -n observability create secret generic clusterpulse-users \
+kubectl -n clusterpulse create secret generic clusterpulse-users \
   --from-file=users=./users
 shred -u ./users 2>/dev/null || rm -f ./users
 ```
@@ -205,7 +296,7 @@ Do not use `--from-literal` with a password. Do not commit the generated hash
 or secret YAML to Git. Rotate credentials by recreating the Secret and reviewing
 your secret-management process.
 
-## 3. Install Prometheus (not currently installed)
+## 3. Install Prometheus (if not installed)
 
 Use the Prometheus Community Helm chart. In an offline/restricted on-prem
 environment, mirror all required images to your internal registry and configure
@@ -255,26 +346,18 @@ Update `k8s/configmap.yaml`:
 Provision `DATABASE_URL`, AI key, SMTP credentials and recipient addresses through your enterprise secret manager. The `k8s/secret-template.yaml`
 is a placeholder only; never apply it unchanged and never commit a populated copy.
 
-Update the container image in `k8s/deployment.yaml`, then deploy:
-
-```bash
-kubectl apply -f k8s/rbac.yaml
-kubectl apply -f k8s/configmap.yaml
-# Create k8s-ai-rca-secrets from your secret manager or a secured deployment pipeline.
-kubectl apply -f k8s/deployment.yaml
-kubectl -n observability rollout status deployment/k8s-ai-rca-agent
-```
-
-The existing application needs PostgreSQL reachable at the configured `DATABASE_URL`.
-Provision PostgreSQL with persistent storage, backups, TLS where required, and
-credentials managed outside Git before starting the agent.
+Deploy the database, secrets, RBAC and application as described in
+"Configure and deploy" above (steps 1 to 3). `k8s/postgres.yaml` provides a
+single-replica PostgreSQL with a PVC; for production add backups
+(for example a scheduled `pg_dump`), TLS where required, and manage credentials
+outside Git.
 
 ## 5. Apply Traefik authentication and routes
 
 ```bash
 kubectl apply -f k8s/traefik-middleware.yaml
 kubectl apply -f k8s/traefik-ingressroute.yaml
-kubectl get ingressroute,middleware -n observability
+kubectl get ingressroute,middleware -n clusterpulse
 ```
 
 If Traefik is installed in a namespace other than `traefik`, adjust the optional
@@ -284,15 +367,15 @@ depends on the cluster CNI.
 ## 6. Verify
 
 ```bash
-kubectl get ingressroute -n observability
-kubectl get secret clusterpulse-users clusterpulse-tls -n observability
-kubectl logs -n observability deployment/k8s-ai-rca-agent --tail=100
+kubectl get ingressroute -n clusterpulse
+kubectl get secret clusterpulse-users clusterpulse-tls -n clusterpulse
+kubectl logs -n clusterpulse deployment/k8s-ai-rca-agent --tail=100
 ```
 
 From a workstation that trusts the TLS issuer:
 
 ```bash
-curl -I https://clusterpulse.example.internal/
+curl -I https://clusterpulse.local/
 ```
 
 Expected behavior:
@@ -355,7 +438,7 @@ application code or image build inputs change. It:
 - The deployment manifest uses `:latest` plus `imagePullPolicy: Always`; the
   revision annotation changes on each source commit and triggers a rollout.
   The immutable `sha-<commit>` tag is also published for traceability and rollback.
-- If the GHCR package is private, create an image pull Secret in the `observability`
+- If the GHCR package is private, create an image pull Secret in the `clusterpulse`
   namespace and add `imagePullSecrets` to the pod spec. For on-prem clusters, ensure
   nodes can reach `ghcr.io`, or mirror the published image into your internal registry.
 - GitHub Actions commits directly to `main`. Branch protection rules that prohibit
