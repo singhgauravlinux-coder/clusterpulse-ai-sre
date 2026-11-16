@@ -2,7 +2,7 @@ apiVersion: v1
 kind: ConfigMap
 metadata:
   name: k8s-ai-rca-config
-  namespace: observability
+  namespace: clusterpulse
 data:
   CLUSTER_NAME: "on-prem-prod"
   ENVIRONMENT: "production"

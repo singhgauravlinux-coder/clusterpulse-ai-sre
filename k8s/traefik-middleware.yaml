@@ -4,7 +4,7 @@ apiVersion: traefik.io/v1alpha1
 kind: Middleware
 metadata:
   name: clusterpulse-basic-auth
-  namespace: observability
+  namespace: clusterpulse
 spec:
   basicAuth:
     secret: clusterpulse-users
@@ -15,7 +15,7 @@ apiVersion: traefik.io/v1alpha1
 kind: Middleware
 metadata:
   name: clusterpulse-https-redirect
-  namespace: observability
+  namespace: clusterpulse
 spec:
   redirectScheme:
     scheme: https
