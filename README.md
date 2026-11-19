@@ -47,11 +47,34 @@ docker build -t YOUR_REGISTRY/k8s-ai-rca-agent:0.1.0 .
 docker push YOUR_REGISTRY/k8s-ai-rca-agent:0.1.0
 ```
 
-## Configure and deploy 
+## Configure and deploy (from scratch)
 
 Everything runs in the `clusterpulse` namespace, including its own PostgreSQL,
-and is served at `https://clusterpulse.local`. Run all commands from the
-repository root after `git pull`. Before starting, edit `k8s/configmap.yaml`
+and is served at `https://clusterpulse.local`.
+
+### Prerequisites
+
+On the machine you deploy from (a server or workstation with cluster access):
+
+- `kubectl` configured for the target cluster (`kubectl get nodes` works)
+- `git`, `openssl`, `jq`, and `htpasswd` (package `apache2-utils` on Debian/Ubuntu,
+  `httpd-tools` on RHEL/CentOS)
+- Traefik with CRDs installed (k3s includes it) and a default StorageClass
+- The container image `ghcr.io/<owner>/<repo>:latest` must be pullable by the nodes.
+  If the GHCR package is private, create an image pull Secret (see "Important
+  deployment notes" below).
+
+### Clone the repository
+
+```bash
+git clone https://github.com/singhgauravlinux-coder/clusterpulse-ai-sre.git
+cd clusterpulse-ai-sre
+git pull            # later, to pick up newer manifests and the image-tag commit
+```
+
+If the repository is private, authenticate first (`gh auth login`, an SSH key, or a
+personal access token) and use the matching clone URL. Run every command below from
+this directory (the repository root). Before starting, edit `k8s/configmap.yaml`
 (`SMTP_FROM`, `EMAIL_RECIPIENTS`, `PROMETHEUS_URL`, AI endpoint and model).
 
 ### 0. Clean namespace
@@ -85,21 +108,98 @@ the PVC explicitly to start with an empty database.
 To use an external or managed PostgreSQL instead, skip `postgres.yaml` and put
 that connection string in `DATABASE_URL` below.
 
-### 2. ConfigMap and application secret
+### 2. Get the AI key and SMTP password, then create the secrets
+
+#### 2a. Gemini API key (`AI_API_KEY`)
+
+The default `k8s/configmap.yaml` uses Google's OpenAI-compatible Gemini endpoint
+(`AI_BASE_URL`) with the model in `AI_MODEL`.
+
+1. Open Google AI Studio: <https://aistudio.google.com/apikey> and sign in with a Google account.
+2. Accept the terms. New users get a default project and key; otherwise click
+   **Create API key** and pick (or create) a Google Cloud project.
+3. Copy the key (it starts with `AIza...`). Treat it like a password.
+4. Recommended: on the same page, mark the key **Restrict to Gemini API only**.
+5. Check that the key works and that your `AI_MODEL` exists. Read the key with
+   `read -s` so it is not stored in shell history:
+
+```bash
+read -rs GEMINI_KEY; echo
+curl -s https://generativelanguage.googleapis.com/v1beta/openai/models \
+  -H "Authorization: Bearer $GEMINI_KEY" | head -c 600
+```
+
+A JSON list of models means the key is valid. `API key not valid` means it was
+copied wrongly. If your `AI_MODEL` is not in the list, set one from the list in
+`k8s/configmap.yaml`. Free-tier keys have rate limits; the agent retries failed
+RCA requests automatically (`rca_max_attempts`).
+
+To use another provider, change `AI_BASE_URL`, `AI_MODEL` and `AI_API_KEY`
+(any OpenAI-compatible `/chat/completions` endpoint, for example an in-house model).
+
+#### 2b. SMTP username and password (`SMTP_USERNAME`, `SMTP_PASSWORD`)
+
+The default ConfigMap uses Gmail (`smtp.gmail.com`, port 587, STARTTLS). Gmail
+does not accept your normal password for SMTP; you need an **app password**:
+
+1. Turn on 2-Step Verification: Google Account > Security > 2-Step Verification.
+   The app password page does not appear without it.
+2. Open <https://myaccount.google.com/apppasswords>, enter a name such as
+   `clusterpulse`, and click **Create**.
+3. Copy the 16-character password. It is shown once; generate a new one if lost.
+   Enter it without spaces.
+4. Use these values:
+   - `SMTP_USERNAME` = the full Gmail address
+   - `SMTP_PASSWORD` = the 16-character app password
+   - `SMTP_FROM` (ConfigMap) = the same Gmail address, because Gmail rewrites other senders
+   - `EMAIL_RECIPIENTS` (ConfigMap) = who receives alerts, comma separated
+
+Notes:
+- Changing your Google account password revokes all app passwords; create a new one
+  and update the secret.
+- The app passwords page is unavailable for Workspace/work or school accounts that
+  disallow it, for accounts using only security keys, and for Advanced Protection.
+  In that case use your organization's SMTP relay: set `SMTP_HOST`, `SMTP_PORT`,
+  `SMTP_STARTTLS`/`SMTP_USE_SSL` in the ConfigMap and the relay's credentials
+  (or none, if the relay allows your cluster's IP) in the secret.
+- Quick test before storing it (prompts for the password, sends nothing):
+
+```bash
+python3 - <<'PY'
+import smtplib, getpass
+user = input("SMTP user: ")
+pw = getpass.getpass("App password: ")
+s = smtplib.SMTP("smtp.gmail.com", 587, timeout=15); s.starttls(); s.login(user, pw)
+print("SMTP login OK"); s.quit()
+PY
+```
+
+#### 2c. Create the ConfigMap and secret
 
 ```bash
 kubectl apply -f k8s/configmap.yaml
 
+read -rs SMTP_PW; echo                      # paste the app password, no spaces
 kubectl -n clusterpulse create secret generic k8s-ai-rca-secrets \
   --from-literal=DATABASE_URL="postgresql+psycopg://clusterpulse:${PGPASS}@clusterpulse-postgres:5432/clusterpulse" \
-  --from-literal=AI_API_KEY='YOUR_AI_KEY' \
-  --from-literal=SMTP_USERNAME='YOUR_SMTP_USER' \
-  --from-literal=SMTP_PASSWORD='YOUR_SMTP_APP_PASSWORD'
+  --from-literal=AI_API_KEY="$GEMINI_KEY" \
+  --from-literal=SMTP_USERNAME='you@gmail.com' \
+  --from-literal=SMTP_PASSWORD="$SMTP_PW"
+unset GEMINI_KEY SMTP_PW
 ```
 
-Never commit a populated secret. See `k8s/secret-template.yaml` and
-`k8s/config-secret-template.yaml` for other supported keys (for example Microsoft
-Graph mail settings). In production use your enterprise secret manager.
+If you open a new shell between steps, re-enter `PGPASS` and `GEMINI_KEY` first;
+the database password must be the same one used in step 1. Never commit a populated
+secret. See `k8s/secret-template.yaml` and `k8s/config-secret-template.yaml` for other
+supported keys. In production use your enterprise secret manager.
+
+To change a value later, patch the secret and restart the pod:
+
+```bash
+kubectl -n clusterpulse patch secret k8s-ai-rca-secrets --type merge \
+  -p "$(jq -n --arg v "$NEW_VALUE" '{stringData:{AI_API_KEY:$v}}')"
+kubectl -n clusterpulse rollout restart deploy/k8s-ai-rca-agent
+```
 
 ### 3. TLS certificate and Basic Auth login
 
@@ -114,15 +214,16 @@ kubectl -n clusterpulse create secret tls clusterpulse-tls --cert=/tmp/tls.crt -
 rm -f /tmp/tls.key /tmp/tls.crt
 
 # htpasswd comes from apache2-utils / httpd-tools; it prompts for the password
-umask 077
-htpasswd -nB clusterpulseadmin > /tmp/users       # type the password when prompted
-cat /tmp/users                                    # must look like: clusterpulseadmin:$2y$05$...
-
+umask 077; htpasswd -nB clusterpulseadmin > /tmp/users
 kubectl -n clusterpulse create secret generic clusterpulse-users --from-file=users=/tmp/users
 shred -u /tmp/users
 ```
 
-Do not use `--from-literal` for the password and do not commit the hash.
+Check `cat /tmp/users` before creating the Secret: it must contain one line like
+`clusterpulseadmin:$2y$05$...`. An empty Secret makes Traefik log
+`secret ... does not contain any credentials`, the middleware is not created, and
+the HTTPS route answers `404`. Do not use `--from-literal` for the password and do
+not commit the hash.
 
 ### 4. RBAC and application
 
@@ -187,8 +288,11 @@ watch the same cluster, so both send alert emails unless you give one different
 | Log `password authentication failed` | `DATABASE_URL` differs from `clusterpulse-postgres-auth`. The password is fixed at first start; if you recreate the secret, delete the PVC too. |
 | Log `... is forbidden: User "system:serviceaccount:<ns>:k8s-ai-rca-agent" cannot list/watch ...` | ClusterRoleBinding subject points at another namespace or was overwritten. Inspect with `kubectl get clusterrolebinding <name> -o yaml` and re-apply `k8s/rbac.yaml` from this repo. |
 | PVC `Pending` | No default StorageClass. Set `storageClassName` in `k8s/postgres.yaml`. With `local-path`, `Pending` until the pod is scheduled is normal. |
+| Log `Incorrect authentication data` / `SMTPAuthenticationError` | Wrong `SMTP_USERNAME` or an app password with spaces or from a revoked session. Create a new app password and patch the secret. |
+| Incidents show RCA `FAILED`/`PENDING` with HTTP 400/401/403/429 | Invalid or restricted `AI_API_KEY`, wrong `AI_MODEL`, or rate limit. Re-run the `curl .../models` check in 2a. |
 | `/readyz` returns 503 | PostgreSQL unreachable. The pod is withheld from traffic, not restarted. |
 | Browser cannot reach `clusterpulse.local` | Missing hosts or DNS entry, or the host clashes with another IngressRoute. |
+| `404` from Traefik and Traefik log `does not contain any credentials` | `clusterpulse-users` is empty. Regenerate with `htpasswd -nB` (not `-cBn`) and recreate the Secret. |
 | `404` from Traefik | Host does not match `k8s/traefik-ingressroute.yaml`, or the IngressRoute is in another namespace than the Service. |
 
 ## API
@@ -328,7 +432,7 @@ Do not use `--from-literal` with a password. Do not commit the generated hash
 or secret YAML to Git. Rotate credentials by recreating the Secret and reviewing
 your secret-management process.
 
-## 3. Install Prometheus (if not installed)
+## 3. Install Prometheus (not currently installed)
 
 Use the Prometheus Community Helm chart. In an offline/restricted on-prem
 environment, mirror all required images to your internal registry and configure
