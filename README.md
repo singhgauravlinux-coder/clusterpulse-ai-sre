@@ -114,7 +114,10 @@ kubectl -n clusterpulse create secret tls clusterpulse-tls --cert=/tmp/tls.crt -
 rm -f /tmp/tls.key /tmp/tls.crt
 
 # htpasswd comes from apache2-utils / httpd-tools; it prompts for the password
-umask 077; htpasswd -cBn clusterpulseadmin > /tmp/users
+umask 077
+htpasswd -nB clusterpulseadmin > /tmp/users       # type the password when prompted
+cat /tmp/users                                    # must look like: clusterpulseadmin:$2y$05$...
+
 kubectl -n clusterpulse create secret generic clusterpulse-users --from-file=users=/tmp/users
 shred -u /tmp/users
 ```
