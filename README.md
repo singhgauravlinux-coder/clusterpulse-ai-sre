@@ -432,7 +432,7 @@ Do not use `--from-literal` with a password. Do not commit the generated hash
 or secret YAML to Git. Rotate credentials by recreating the Secret and reviewing
 your secret-management process.
 
-## 3. Install Prometheus (not currently installed)
+## 3. Install Prometheus (If not installed)
 
 Use the Prometheus Community Helm chart. In an offline/restricted on-prem
 environment, mirror all required images to your internal registry and configure
